@@ -182,7 +182,7 @@ test("password reset updates the account password", async () => {
   assert.ok(newPasswordLogin.body.token);
 });
 
-test("dashboard APIs and write paths work for the SQLite/demo flow", async () => {
+test("new accounts cannot access sample dashboard data before setup", async () => {
   const email = `dashboard-${Date.now()}@example.com`;
   const token = await signupAndVerify(email);
   const authHeaders = {
@@ -192,9 +192,60 @@ test("dashboard APIs and write paths work for the SQLite/demo flow", async () =>
   const summary = await request("/dashboard/summary", {
     headers: authHeaders,
   });
+  assert.equal(summary.status, 400);
+  assert.match(summary.body.error, /shop setup/i);
+});
+
+test("dashboard APIs and write paths work in the demo workspace", async () => {
+  const login = await request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({
+      email: "demo@orrico.com",
+      password: "demo123",
+    }),
+  });
+
+  assert.equal(login.status, 200);
+  assert.equal(login.body.user.authProvider, "demo");
+
+  const authHeaders = {
+    Authorization: `Bearer ${login.body.token}`,
+  };
+
+  const restoredSession = await request("/auth/session", {
+    headers: authHeaders,
+  });
+  assert.equal(restoredSession.status, 200);
+  assert.equal(restoredSession.body.user.id, "demo-user");
+  assert.equal(restoredSession.body.user.authProvider, "demo");
+
+  const invalidLogin = await request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({
+      email: "demo@orrico.com",
+      password: "wrong-password",
+    }),
+  });
+  assert.equal(invalidLogin.status, 401);
+
+  const summary = await request("/dashboard/summary", {
+    headers: authHeaders,
+  });
   assert.equal(summary.status, 200);
   assert.equal(summary.body.available, true);
   assert.ok(summary.body.metrics.length >= 4);
+
+  const chat = await request("/chat/message", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      message: "Show me the top 5 products this week",
+    }),
+  });
+  assert.equal(chat.status, 200);
+  assert.ok(chat.body.reply);
+  assert.ok(chat.body.sql);
+  assert.match(chat.body.mode, /rag/);
 
   const createdProduct = await request("/dashboard/products", {
     method: "POST",

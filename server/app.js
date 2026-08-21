@@ -149,6 +149,14 @@ function sanitizeUser(user) {
   };
 }
 
+function isDemoUser(user) {
+  return (
+    user?.authProvider === "demo" ||
+    user?.id === "demo-user" ||
+    String(user?.email || "").trim().toLowerCase() === "demo@orrico.com"
+  );
+}
+
 function createAuditEntry(request, event, userId) {
   const forwardedFor = request.headers["x-forwarded-for"];
   const ip = Array.isArray(forwardedFor)
@@ -208,7 +216,7 @@ function sanitizeConnection(connection) {
 
 function canUseDemoWorkspace(user, connection) {
   return (
-    user?.authProvider === "demo" ||
+    isDemoUser(user) ||
     Boolean(connection?.isDemoConnection)
   );
 }
@@ -673,7 +681,27 @@ app.post("/api/auth/login", async (request, response) => {
     (entry) => entry.email.toLowerCase() === normalizedEmail,
   );
 
-  if (user?.authProvider === "password") {
+  if (normalizedEmail === "demo@orrico.com") {
+    if (String(password) !== "demo123") {
+      user = null;
+    } else {
+      if (!user) {
+        user = {
+          id: "demo-user",
+          createdAt: new Date().toISOString(),
+        };
+        data.users.push(user);
+      }
+
+      Object.assign(user, {
+        firstName: "Demo",
+        lastName: "User",
+        email: normalizedEmail,
+        businessName: "Demo Retail Store",
+        authProvider: "demo",
+      });
+    }
+  } else if (user?.authProvider === "password") {
     const submittedPassword = String(password);
     const legacyPassword = user.password;
     let isAuthenticated = false;
@@ -694,22 +722,6 @@ app.post("/api/auth/login", async (request, response) => {
 
     if (!isAuthenticated) {
       user = null;
-    }
-  }
-
-  if (!user && normalizedEmail === "demo@orrico.com" && password === "demo123") {
-    user = {
-      id: "demo-user",
-      firstName: "Demo",
-      lastName: "User",
-      email: normalizedEmail,
-      businessName: "Demo Retail Store",
-      authProvider: "demo",
-      createdAt: new Date().toISOString(),
-    };
-
-    if (!data.users.find((entry) => entry.id === user.id)) {
-      data.users.push(user);
     }
   }
 

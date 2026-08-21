@@ -1,14 +1,14 @@
 import { Mic, Database, Zap } from "lucide-react";
-import { toast } from "sonner";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { ImageWithFallback } from "./ImageWithFallback";
 
 interface HeroProps {
   onGetStartedClick?: () => void;
+  onDemoClick?: () => void;
 }
 
-export function Hero({ onGetStartedClick }: HeroProps) {
+export function Hero({ onGetStartedClick, onDemoClick }: HeroProps) {
   return (
     <section className="relative overflow-hidden py-18 lg:py-24">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.12),transparent_24%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.1),transparent_22%)]" />
@@ -38,10 +38,7 @@ export function Hero({ onGetStartedClick }: HeroProps) {
               <Button
                 size="lg"
                 className="gap-2 px-6"
-                onClick={() => {
-                  toast.info("Voice demo: sign up to try it live.");
-                  onGetStartedClick?.();
-                }}
+                onClick={onDemoClick}
               >
                 <Mic className="h-5 w-5" />
                 Try Voice Demo
