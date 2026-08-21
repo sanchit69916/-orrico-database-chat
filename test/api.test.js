@@ -137,6 +137,50 @@ test("health endpoints expose runtime status", async () => {
   assert.equal(ready.body.ready, true);
 });
 
+test("API boundaries return structured errors", async () => {
+  const missingRoute = await request("/does-not-exist");
+  assert.equal(missingRoute.status, 404);
+  assert.equal(missingRoute.body.error, "API endpoint not found.");
+  assert.ok(missingRoute.body.requestId);
+
+  const malformedResponse = await fetch(`${baseUrl}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{not-json",
+  });
+  const malformedBody = await malformedResponse.json();
+  assert.equal(malformedResponse.status, 400);
+  assert.equal(malformedBody.error, "Malformed JSON body.");
+  assert.ok(malformedBody.requestId);
+});
+
+test("authentication inputs have bounded lengths", async () => {
+  const oversizedSignup = await request("/auth/signup", {
+    method: "POST",
+    body: JSON.stringify({
+      firstName: "A".repeat(81),
+      lastName: "User",
+      email: `bounded-${Date.now()}@example.com`,
+      businessName: "Test Store",
+      password: "password123",
+    }),
+  });
+
+  assert.equal(oversizedSignup.status, 400);
+  assert.match(oversizedSignup.body.error, /too long/i);
+
+  const oversizedLogin = await request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({
+      email: "demo@orrico.com",
+      password: "x".repeat(257),
+    }),
+  });
+
+  assert.equal(oversizedLogin.status, 400);
+  assert.equal(oversizedLogin.body.error, "Invalid login request.");
+});
+
 test("password reset updates the account password", async () => {
   const email = `reset-${Date.now()}@example.com`;
   await signupAndVerify(email);
@@ -211,6 +255,13 @@ test("dashboard APIs and write paths work in the demo workspace", async () => {
   const authHeaders = {
     Authorization: `Bearer ${login.body.token}`,
   };
+
+  const oversizedChat = await request("/chat/message", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({ message: "x".repeat(4001) }),
+  });
+  assert.equal(oversizedChat.status, 413);
 
   const restoredSession = await request("/auth/session", {
     headers: authHeaders,

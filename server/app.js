@@ -12,6 +12,7 @@ import {
   isPasswordHash,
   isSessionExpired,
   isTimedTokenExpired,
+  shouldRefreshSession,
   touchSession,
   verifyPassword,
 } from "./auth.js";
@@ -90,8 +91,26 @@ const chatRateLimit = rateLimit({
   message: { error: "Too many requests. Please slow down." },
 });
 
+const apiRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (request) => request.path.startsWith("/health"),
+  message: { error: "Too many requests. Please try again shortly." },
+});
+
+const authEndpointRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many authentication requests. Try again later." },
+});
+
 export const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 app.use(
   helmet({
@@ -116,6 +135,10 @@ app.use(
     credentials: true,
   }),
 );
+app.use(requestContextMiddleware);
+app.use(requestLoggerMiddleware);
+app.use("/api", apiRateLimit);
+app.use("/api/auth", authEndpointRateLimit);
 app.use(cookieParser());
 app.use(
   express.json({
@@ -127,8 +150,6 @@ app.use(
     },
   }),
 );
-app.use(requestContextMiddleware);
-app.use(requestLoggerMiddleware);
 
 const authAttemptStore = new Map();
 const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
@@ -282,7 +303,19 @@ function normalizeEmail(email) {
 }
 
 function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return (
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function isTextLengthValid(value, maximum) {
+  const text = normalizeText(value);
+  return text.length > 0 && text.length <= maximum;
 }
 
 async function pruneExpiredSessions(data) {
@@ -415,8 +448,10 @@ async function getSessionFromRequest(request) {
     return null;
   }
 
-  touchSession(session);
-  await writeData(data);
+  if (shouldRefreshSession(session)) {
+    touchSession(session);
+    await writeData(data);
+  }
 
   return { data, token, session, user };
 }
@@ -464,26 +499,34 @@ async function deliverPasswordResetEmail(user, token) {
   );
 }
 
-app.get("/api/health", async (_request, response) => {
-  const storeHealth = await checkStoreHealth();
-  const storeInfo = getStoreInfo();
-  const runtime = getRuntimeSummary({
-    storeMode: getStoreMode(),
-    storeHealth,
-  });
+app.get("/api/health", async (request, response) => {
+  try {
+    const storeHealth = await checkStoreHealth();
+    const storeInfo = getStoreInfo();
+    const runtime = getRuntimeSummary({
+      storeMode: getStoreMode(),
+      storeHealth,
+    });
 
-  response.json({
-    status: storeHealth.ok ? "ok" : "degraded",
-    timestamp: new Date().toISOString(),
-    store: {
-      ...storeInfo,
-      ...storeHealth,
-    },
-    runtime,
-  });
+    response.json({
+      status: storeHealth.ok ? "ok" : "degraded",
+      timestamp: new Date().toISOString(),
+      store: {
+        ...storeInfo,
+        ...storeHealth,
+      },
+      runtime,
+    });
+  } catch {
+    response.status(503).json({
+      status: "degraded",
+      timestamp: new Date().toISOString(),
+      requestId: request.requestId,
+    });
+  }
 });
 
-app.get("/api/health/ready", async (_request, response) => {
+app.get("/api/health/ready", async (request, response) => {
   try {
     const storeHealth = await checkStoreHealth();
     const runtime = getRuntimeSummary({
@@ -498,13 +541,12 @@ app.get("/api/health/ready", async (_request, response) => {
       timestamp: new Date().toISOString(),
       runtime,
     });
-  } catch (error) {
+  } catch {
     response.status(503).json({
       ready: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Readiness check failed.",
+      timestamp: new Date().toISOString(),
+      error: "A required backend dependency is unavailable.",
+      requestId: request.requestId,
     });
   }
 });
@@ -520,6 +562,17 @@ app.post("/api/auth/signup", async (request, response) => {
 
   if (!firstName || !lastName || !email || !businessName || !password) {
     response.status(400).json({ error: "Missing required fields." });
+    return;
+  }
+
+  if (
+    !isTextLengthValid(firstName, 80) ||
+    !isTextLengthValid(lastName, 80) ||
+    !isTextLengthValid(businessName, 160)
+  ) {
+    response.status(400).json({
+      error: "Name or business details are too long.",
+    });
     return;
   }
 
@@ -540,11 +593,11 @@ app.post("/api/auth/signup", async (request, response) => {
     return;
   }
 
-  if (String(password).length < 8) {
+  if (String(password).length < 8 || String(password).length > 256) {
     recordFailedAuthAttempt(rateLimit.key);
     response
       .status(400)
-      .json({ error: "Password must be at least 8 characters." });
+      .json({ error: "Password must be between 8 and 256 characters." });
     return;
   }
 
@@ -595,10 +648,10 @@ app.post("/api/auth/signup", async (request, response) => {
 
   const user = {
     id: crypto.randomUUID(),
-    firstName: String(firstName).trim(),
-    lastName: String(lastName).trim(),
+    firstName: normalizeText(firstName),
+    lastName: normalizeText(lastName),
     email: normalizedEmail,
-    businessName: String(businessName).trim(),
+    businessName: normalizeText(businessName),
     passwordHash: await hashPassword(String(password)),
     authProvider: "password",
     createdAt: new Date().toISOString(),
@@ -671,6 +724,12 @@ app.post("/api/auth/login", async (request, response) => {
   if (!normalizedEmail || !password) {
     recordFailedAuthAttempt(rateLimit.key);
     response.status(400).json({ error: "Email and password are required." });
+    return;
+  }
+
+  if (!isValidEmail(normalizedEmail) || String(password).length > 256) {
+    recordFailedAuthAttempt(rateLimit.key);
+    response.status(400).json({ error: "Invalid login request." });
     return;
   }
 
@@ -1721,9 +1780,17 @@ app.post("/api/chat/message", chatRateLimit, async (request, response) => {
   }
 
   const { message } = request.body || {};
+  const normalizedMessage = normalizeText(message);
 
-  if (!message || !String(message).trim()) {
+  if (!normalizedMessage) {
     response.status(400).json({ error: "Message is required." });
+    return;
+  }
+
+  if (normalizedMessage.length > 4000) {
+    response.status(413).json({
+      error: "Message must be 4,000 characters or fewer.",
+    });
     return;
   }
 
@@ -1756,9 +1823,11 @@ app.post("/api/chat/message", chatRateLimit, async (request, response) => {
   try {
     const preparedConnection = prepareConnectionForUse(connection);
     if (process.env.ANTHROPIC_API_KEY) {
-      result = await buildLlmChatReply(String(message), preparedConnection);
+      result = await buildLlmChatReply(normalizedMessage, preparedConnection);
     } else {
-      result = await buildRagChatReply(String(message), { connection: preparedConnection });
+      result = await buildRagChatReply(normalizedMessage, {
+        connection: preparedConnection,
+      });
     }
   } catch (error) {
     response.status(400).json({
@@ -1773,7 +1842,7 @@ app.post("/api/chat/message", chatRateLimit, async (request, response) => {
   session.data.chatHistory.push({
     id: crypto.randomUUID(),
     userId: session.user.id,
-    message: String(message).trim(),
+    message: normalizedMessage,
     reply: result.reply,
     mode: result.mode,
     createdAt: new Date().toISOString(),
@@ -1987,6 +2056,13 @@ app.delete("/api/account", async (request, response) => {
   appendAuditEntry(createAuditEntry(request, "account_deleted", user.id)).catch(() => undefined);
 
   response.json({ ok: true, message: "Account and all associated data deleted." });
+});
+
+app.use("/api", (request, response) => {
+  response.status(404).json({
+    error: "API endpoint not found.",
+    requestId: request.requestId,
+  });
 });
 
 app.use(errorHandler);
